@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+train/
+*.zip
+semicon-restore/results/
+NoisyLR 2 copy/
+train/
+semicon-restore/results/
+semicon-restore/checkpoints/
+*.zip

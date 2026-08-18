@@ -69,8 +69,18 @@ Place the official dataset locally in:
 ```text
 data/official/
 ├── train/
+│   └── train/
+│       ├── GT/          # 3,200 files, clean, 256x256
+│       └── NoisyLR/     # 3,200 files, degraded, 128x128, same filenames as GT
 └── Test_NoisyLR/
+    └── NoisyLR/         # 400 files, official test inputs, no ground truth
 ```
+
+The doubled `train/train/` is not a typo — it's how the organizer's
+`train.zip` unpacks (the zip's top-level folder is itself named `train`).
+`GT_DIR`/`NOISY_DIR` in `scripts/train.py`, `scripts/evaluate.py` and
+`scripts/baseline.py` already point at this exact path — don't "fix" it
+to a single `train/` level, that would break a working path.
 
 ---
 

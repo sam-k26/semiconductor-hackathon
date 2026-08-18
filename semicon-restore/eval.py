@@ -161,17 +161,24 @@ def process_batch(
     output_dir: Path,
     device: torch.device,
     use_tta: bool,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, float]:
     """
     Process a batch of valid tensors. If shapes match, processes as a single batch tensor.
     If spatial shapes vary, falls back to processing image by image.
-    Returns (success_count, fail_count).
+
+    Returns (success_count, fail_count, model_only_seconds). model_only_seconds
+    is wall-clock time spent strictly inside the forward pass(es) for this
+    batch, bracketed by torch.cuda.synchronize() so it reflects actual
+    execution rather than queued-but-unfinished kernels — kept separate from
+    the caller's end-to-end timer (discover/read/H2D/forward/D2H/write) so
+    I/O overhead is never hidden behind a flattering GPU-only number.
     """
     successes = 0
     failures = 0
+    model_only_seconds = 0.0
 
     if not batch_tensors:
-        return (0, 0)
+        return (0, 0, 0.0)
 
     # Check if all shapes in batch are identical
     first_shape = batch_tensors[0].shape
@@ -180,13 +187,19 @@ def process_batch(
     if same_shape:
         try:
             stacked = torch.stack(batch_tensors, dim=0).to(device)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            forward_start = time.perf_counter()
             with torch.inference_mode():
                 if use_tta:
                     out = tta_forward(model, stacked)
                 else:
                     out = model(stacked)
-                out = torch.clamp(out, 0.0, 1.0)
-            
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            model_only_seconds += time.perf_counter() - forward_start
+            out = torch.clamp(out, 0.0, 1.0)
+
             # Save individual outputs
             for i, p in enumerate(batch_paths):
                 try:
@@ -197,22 +210,29 @@ def process_batch(
                 except Exception as save_err:
                     logger.error(f"Failed to write output for {p.name}: {save_err}")
                     failures += 1
-            return (successes, failures)
+            return (successes, failures, model_only_seconds)
         except Exception as batch_err:
             logger.warning(
                 f"Batch execution failed with error ({batch_err}). Falling back to per-file processing."
             )
+            model_only_seconds = 0.0
 
     # Fallback / heterogeneous shape handling: process item by item
     for tensor, path in zip(batch_tensors, batch_paths):
         try:
             x = tensor.unsqueeze(0).to(device)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            forward_start = time.perf_counter()
             with torch.inference_mode():
                 if use_tta:
                     out = tta_forward(model, x)
                 else:
                     out = model(x)
-                out = torch.clamp(out, 0.0, 1.0)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            model_only_seconds += time.perf_counter() - forward_start
+            out = torch.clamp(out, 0.0, 1.0)
             res_np = out[0, 0].cpu().numpy().astype(np.float32)
             out_path = output_dir / path.name
             np.save(out_path, res_np)
@@ -221,7 +241,7 @@ def process_batch(
             logger.error(f"Error restoring {path.name}: {item_err}")
             failures += 1
 
-    return (successes, failures)
+    return (successes, failures, model_only_seconds)
 
 
 def main() -> int:
@@ -280,6 +300,7 @@ def main() -> int:
 
     total_successes = 0
     total_failures = 0
+    total_model_seconds = 0.0
 
     current_batch_tensors: List[torch.Tensor] = []
     current_batch_paths: List[Path] = []
@@ -302,7 +323,7 @@ def main() -> int:
 
         # When batch is full or at last file, process batch
         if len(current_batch_tensors) >= args.batch_size or (file_idx == total_files - 1 and current_batch_tensors):
-            s, f = process_batch(
+            s, f, model_seconds = process_batch(
                 model=model,
                 batch_tensors=current_batch_tensors,
                 batch_paths=current_batch_paths,
@@ -312,6 +333,7 @@ def main() -> int:
             )
             total_successes += s
             total_failures += f
+            total_model_seconds += model_seconds
             current_batch_tensors = []
             current_batch_paths = []
 
@@ -319,8 +341,20 @@ def main() -> int:
         torch.cuda.synchronize()
     elapsed_time = time.perf_counter() - start_time
 
-    avg_ms = (elapsed_time / total_successes * 1000.0) if total_successes > 0 else 0.0
-    throughput = (total_successes / elapsed_time) if elapsed_time > 0 else 0.0
+    # End-to-end: discover -> read -> tensor -> H2D -> forward -> D2H -> write.
+    e2e_avg_ms = (elapsed_time / total_successes * 1000.0) if total_successes > 0 else 0.0
+    e2e_throughput = (total_successes / elapsed_time) if elapsed_time > 0 else 0.0
+
+    # Model-only: strictly the forward pass(es), summed across process_batch
+    # calls and bracketed by torch.cuda.synchronize() in each. Reported
+    # separately from end-to-end so I/O overhead is never hidden behind a
+    # flattering GPU-only number.
+    model_avg_ms = (
+        (total_model_seconds / total_successes * 1000.0) if total_successes > 0 else 0.0
+    )
+    model_throughput = (
+        (total_successes / total_model_seconds) if total_model_seconds > 0 else 0.0
+    )
 
     print("=" * 70)
     print(" INFERENCE SUMMARY")
@@ -329,8 +363,15 @@ def main() -> int:
     logger.info(f"Successfully Restored:  {total_successes}")
     logger.info(f"Failed / Skipped Files: {total_failures}")
     logger.info(f"Total Elapsed Time:     {elapsed_time:.3f} s")
-    logger.info(f"Mean Latency per Image: {avg_ms:.2f} ms")
-    logger.info(f"Throughput:             {throughput:.2f} images/sec")
+    logger.info(
+        f"End-to-End Latency:     {e2e_avg_ms:.2f} ms/image "
+        f"({e2e_throughput:.2f} images/sec) "
+        "[discover+read+H2D+forward+D2H+write]"
+    )
+    logger.info(
+        f"Model-Only Latency:     {model_avg_ms:.2f} ms/image "
+        f"({model_throughput:.2f} images/sec) [forward pass only]"
+    )
     print("=" * 70)
 
     return 0 if total_successes > 0 or total_files == 0 else 1

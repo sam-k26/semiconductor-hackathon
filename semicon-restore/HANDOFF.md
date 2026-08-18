@@ -4,6 +4,34 @@ Newest first. One entry per completed phase. Keep entries short — if an entry 
 
 ---
 
+## Handoff 2 — eval.py found and hardened; retrain moved to Colab (2026-08-17)
+
+The user pushed the repo to GitHub (`origin: sam-k26/semiconductor-hackathon`) to move training onto Google Colab (this dev machine is CPU-only and too slow — ~25 min/epoch, made unusable by a from-scratch retrain and repeated OOM kills of the demo backend under memory pressure). The push revealed a teammate ("matin impex") had independently authored a full `eval.py` (340 lines, commit `1014598`), not written by this thread.
+
+**Built:** `eval.py` reviewed in full and found to already satisfy nearly all of PRD §6.1 — proper CLI, `.npy`-only discovery, exact filename matching, per-file error isolation, no hardcoded shape, empty-dir handling, `inference_mode`+warmup+`cuda.synchronize()`, device auto-detect with explicit startup logging, TTA on by default with `--no-tta` override. Fixed the one real gap found: it reported a single combined timing number, not the end-to-end vs. model-only split Phase 5 requires — `process_batch` now returns `model_only_seconds` (forward pass only, bracketed by `cuda.synchronize()`) separately from the caller's end-to-end timer.
+
+**Working:**
+- `eval.py` run end-to-end 2026-08-17 against the real 400-image official test set: 400/400 restored, 0 failures, output filenames match input exactly, `(256,256)` float32 in `[0,1]`.
+- New timing split verified: on this CPU machine, 684.40 ms/image end-to-end vs. 683.44 ms/image model-only (nearly identical here — 4-way TTA dominates on CPU; expect the gap to be far more visible on H100).
+- Confirmed the GitHub push includes every fix from Handoff 1's session: `data/splits/split_v2_leakage_safe.json`, `RESUME_CHECKPOINT = None` in `train.py`, the corrected `baseline.py`/`evaluate.py` split-loading — so training on Colab from this repo state will use the corrected split, not the leaky one.
+
+**Not built:** the corrected-split retrain itself — moved to Colab, not run to completion anywhere yet. LPIPS. Denoise-then-bicubic baseline. Data-consistency check (downsample prediction, compare to input) — this is cited in the current pitch narrative as a differentiator but does not exist in code. Deck. `requirements.txt` still unpinned.
+
+**Known issues:**
+- **`eval.py`'s `.npy`-in/`.npy`-out/float32 design is still an unverified assumption**, not a confirmed fact — Component 2 of the submission requirements (the official file-format contract) was never actually provided in this thread. Good code doesn't resolve that risk; only reading the actual problem PDF does.
+- Local `checkpoints/best.pth` is unchanged — still trained on the old, leaky split. Whatever Colab produces needs to be brought back and re-measured before it replaces this checkpoint.
+
+**Decisions made:**
+- Training moved off this Mac entirely, onto Colab, via the GitHub push rather than a zip upload (this repo already has a Colab-ready README section from Handoff 0's era).
+- Demo backend was stopped locally during the (since-abandoned) local retrain attempt to free memory, then restarted.
+
+**Next phase needs:**
+- Bring back whatever checkpoint Colab produces, verify it against the corrected split's bicubic baseline (22.7054 dB / 0.520718 SSIM, already measured), and only then update the reported headline numbers.
+- Still need Component 2 of the submission requirements — everything eval.py does is a well-reasoned guess until that's read.
+- Decide whether to build the data-consistency check before or after the retrain lands, since the pitch narrative already claims it.
+
+---
+
 ## Handoff 1 — Repo consolidation and current-state audit (2026-08-16)
 
 Two separate locations existed: `PRD.md`/`CLAUDE.md`/`HANDOFF.md` in one directory describing a structure that was never built, and a working `semicon-restore/` git repo (uncommitted, no remote) one level down with a real trained model, dataset loader, training/eval/predict scripts, and 400 predictions already generated against the official test set. This handoff merges them — `semicon-restore/` is now the project root.

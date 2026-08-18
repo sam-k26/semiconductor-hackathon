@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Wand2, Play, ImagePlus, Check, UploadCloud, Columns, Square, ZoomIn, RotateCcw,
-  MoveHorizontal, Info, Image as ImageIcon, Sliders, Cpu, Sparkles, FlaskConical,
+  MoveHorizontal, Image as ImageIcon, Sliders, Cpu, Sparkles, Info,
 } from "lucide-react";
 
 // ============================================================================
@@ -29,8 +29,8 @@ const T = {
   input: "#C1782E", output: "#3E7C4F", gt: "#3E6E96", baseline: "#8A7F6A",
   good: "#3E7C4F", bad: "#C25438",
 };
-const LAYER_COLOR = { input: T.input, output: T.output, gt: T.gt, baseline: T.baseline };
-const LAYER_LABEL = { input: "degraded input", output: "restored output", gt: "ground truth", baseline: "bicubic baseline" };
+const LAYER_COLOR = { input: T.input, output: T.output, baseline: T.baseline };
+const LAYER_LABEL = { input: "degraded input", output: "restored output", baseline: "bicubic baseline" };
 const DISPLAY = "'Pixelify Sans', system-ui, sans-serif";
 const MONO = "'JetBrains Mono', monospace";
 const BORDER = `2px solid ${T.ink}`;
@@ -92,11 +92,21 @@ function cloneCanvas(canvas) {
   c.getContext("2d").drawImage(canvas, 0, 0); return c;
 }
 const toDataURL = (c) => c.toDataURL("image/png");
-async function urlToImageData(url, w, h) {
-  const img = await loadImageEl(url);
-  const c = document.createElement("canvas"); c.width = w; c.height = h;
-  const ctx = c.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(img, 0, 0, w, h); return ctx.getImageData(0, 0, w, h);
+// The model is grayscale-only (matches the KLA problem scope: "colour
+// images are NOT part of this challenge") — the backend converts every
+// upload to grayscale before restoring it. Detect color input so the UI
+// can say so, rather than let a judge be confused why the output isn't
+// colorful.
+function detectIsColor(canvas) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const { width: w, height: h } = canvas;
+  const data = ctx.getImageData(0, 0, w, h).data;
+  const step = Math.max(4, Math.floor(data.length / 4 / 2000) * 4);
+  for (let i = 0; i < data.length; i += step) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    if (Math.abs(r - g) > 6 || Math.abs(g - b) > 6 || Math.abs(r - b) > 6) return true;
+  }
+  return false;
 }
 function gaussianBlur(canvas, passes = 1) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -131,31 +141,6 @@ function addGaussianNoise(canvas, sigma = 18, seed = 1) {
   out.getContext("2d").putImageData(d, 0, 0); return out;
 }
 
-// ---- pure full-reference metrics -------------------------------------------
-const MAXV = 255;
-function mse(a, b) { let s = 0, n = 0; for (let i = 0; i < a.length; i += 4) for (let c = 0; c < 3; c++) { const d = a[i + c] - b[i + c]; s += d * d; n++; } return n ? s / n : 0; }
-function mae(a, b) { let s = 0, n = 0; for (let i = 0; i < a.length; i += 4) for (let c = 0; c < 3; c++) { s += Math.abs(a[i + c] - b[i + c]); n++; } return n ? s / n : 0; }
-const rmse = (a, b) => Math.sqrt(mse(a, b));
-function psnr(a, b) { const m = mse(a, b); return m === 0 ? Infinity : 10 * Math.log10((MAXV * MAXV) / m); }
-const luma = (arr, i) => 0.299 * arr[i] + 0.587 * arr[i + 1] + 0.114 * arr[i + 2];
-function ssim(a, b, width, height, win = 8) {
-  const C1 = (0.01 * MAXV) ** 2, C2 = (0.03 * MAXV) ** 2;
-  let total = 0, windows = 0;
-  for (let wy = 0; wy < height; wy += win) for (let wx = 0; wx < width; wx += win) {
-    const w = Math.min(win, width - wx), h = Math.min(win, height - wy), n = w * h;
-    if (n === 0) continue;
-    let ma = 0, mb = 0;
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = ((wy + y) * width + (wx + x)) * 4; ma += luma(a, i); mb += luma(b, i); }
-    ma /= n; mb /= n;
-    let va = 0, vb = 0, cov = 0;
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = ((wy + y) * width + (wx + x)) * 4; const da = luma(a, i) - ma, db = luma(b, i) - mb; va += da * da; vb += db * db; cov += da * db; }
-    va /= n; vb /= n; cov /= n;
-    total += ((2 * ma * mb + C1) * (2 * cov + C2)) / ((ma * ma + mb * mb + C1) * (va + vb + C2)); windows++;
-  }
-  return windows ? total / windows : 1;
-}
-const fullReferenceMetrics = (cand, ref, w, h) => ({ psnr: psnr(cand, ref), ssim: ssim(cand, ref, w, h), mae: mae(cand, ref), rmse: rmse(cand, ref) });
-
 // ---- synthetic sample pairs (clearly labeled demo data) --------------------
 const GT_SIZE = 256;
 function drawCleanScene(seed) {
@@ -187,19 +172,20 @@ function buildSamplePairs() {
   return specs.map((s) => {
     const clean = drawCleanScene(s.id.length);
     const { input, scaleFactor } = s.degrade(clean);
-    return { id: s.id, name: s.name, url: toDataURL(input), width: input.width, height: input.height, gtUrl: toDataURL(clean), degradation: s.degradation, isSample: true, note: s.note, scaleFactor };
+    return { id: s.id, name: s.name, url: toDataURL(input), width: input.width, height: input.height, degradation: s.degradation, isSample: true, note: s.note, scaleFactor, isColor: detectIsColor(input) };
   });
 }
 
 // ---- real restorer: calls demo/backend, which runs checkpoints/best.pth ---
-function referenceSize(srcCanvas, gtImg, scaleFactor) {
-  if (gtImg) return { w: gtImg.naturalWidth, h: gtImg.naturalHeight };
-  const f = scaleFactor || 1; return { w: srcCanvas.width * f, h: srcCanvas.height * f };
+function referenceSize(srcCanvas, scaleFactor) {
+  // The model is a fixed 2x SR net (checkpoints/best.pth) — default to 2x
+  // so the baseline is sized the same as the real restored output, even
+  // for uploads that don't carry a known scaleFactor.
+  const f = scaleFactor || 2; return { w: srcCanvas.width * f, h: srcCanvas.height * f };
 }
-async function buildBaseline({ imageUrl, gtUrl, scaleFactor }) {
+async function buildBaseline({ imageUrl, scaleFactor }) {
   const img = await loadImageEl(imageUrl), src = canvasFromImageEl(img);
-  const gtImg = gtUrl ? await loadImageEl(gtUrl) : null;
-  const { w, h } = referenceSize(src, gtImg, scaleFactor);
+  const { w, h } = referenceSize(src, scaleFactor);
   return { url: toDataURL(resizeCanvas(src, w, h)), width: w, height: h };
 }
 async function runBackendRestore({ imageUrl }) {
@@ -286,6 +272,12 @@ const Tag = ({ color, children }) => (
 );
 const Demo = () => <span style={{ fontFamily: MONO, fontSize: 9, fontWeight: 700, letterSpacing: 1, color: T.cream2, background: T.ink, padding: "2px 5px", borderRadius: 2 }}>DEMO</span>;
 const ErrorNote = ({ children }) => <div style={{ ...panel("#F3DCCF", 4), padding: "10px 12px", color: "#7A2E17", fontFamily: MONO, fontSize: 12.5, lineHeight: 1.5 }}>{children}</div>;
+const ColorWarning = () => (
+  <div style={{ display: "flex", alignItems: "flex-start", gap: 10, ...panel(T.yellow, 4), padding: "10px 13px", color: T.ink, fontSize: 12.5, fontFamily: MONO, lineHeight: 1.5 }}>
+    <Info size={16} color={T.ink} style={{ flex: "0 0 auto", marginTop: 1 }} />
+    <span><strong>Color input detected.</strong> This model is grayscale-only, matching the KLA challenge scope. The image is converted to grayscale before restoring, and the output will be grayscale too — that's expected, not an error.</span>
+  </div>
+);
 
 // ---- one image panel -------------------------------------------------------
 function ViewerStage({ layer, url, transformFor, onZoom, onPan, onReset, clip, showLabel = true, height = 300, interactive = true, frame = true }) {
@@ -439,13 +431,7 @@ function CompareViewer({ layers }) {
 }
 
 // ---- results ---------------------------------------------------------------
-const fmt = (v, d = 3) => (v === Infinity ? "∞" : Number.isFinite(v) ? v.toFixed(d) : "—");
-function deltaOf(v, b, higherBetter) {
-  if (b == null || !Number.isFinite(v) || !Number.isFinite(b)) return null;
-  const d = v - b;
-  return { text: `${d >= 0 ? "+" : ""}${d.toFixed(2)} vs bicubic`, better: higherBetter ? d > 0 : d < 0 };
-}
-function MetricCard({ label, value, unit, delta, accent, big }) {
+function MetricCard({ label, value, unit, accent, big }) {
   return (
     <div style={{ ...panel(T.paper, big ? 5 : 4), padding: big ? "13px 14px 15px" : "11px 12px" }}>
       <div style={{ fontSize: 10, fontFamily: MONO, fontWeight: 600, letterSpacing: 0.7, textTransform: "uppercase", color: T.dim }}>{label}</div>
@@ -453,45 +439,23 @@ function MetricCard({ label, value, unit, delta, accent, big }) {
         <span style={{ fontFamily: DISPLAY, fontSize: big ? 34 : 22, fontWeight: 600, color: accent || T.ink, lineHeight: 1 }}>{value}</span>
         {unit && <span style={{ fontSize: 12, fontFamily: MONO, color: T.faint }}>{unit}</span>}
       </div>
-      {delta && <div style={{ marginTop: 7, fontSize: 10.5, fontFamily: MONO, fontWeight: 600, color: delta.better ? T.good : T.bad }}>{delta.text}</div>}
     </div>
   );
 }
-function ResultsPanel({ result, modelMetrics, baselineMetrics, hasGT, baselineEnabled, onToggleBaseline, busy }) {
-  const showDelta = baselineEnabled && baselineMetrics;
+function ResultsPanel({ result, baselineEnabled, onToggleBaseline, busy }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14, position: "sticky", top: 18 }}>
-      <Card title="Results" sub={result ? (hasGT ? "quality vs. ground truth" : "restored output") : "shown after you restore"}>
+      <Card title="Results" sub={result ? "restored output" : "shown after you restore"}>
         {busy && !result ? (
           <div style={{ color: T.dim, fontSize: 12.5, fontFamily: MONO }}>Restoring…</div>
         ) : !result ? (
-          <div style={{ color: T.dim, fontSize: 12.5, fontFamily: MONO, lineHeight: 1.6 }}>Restore an image to see PSNR, SSIM, and inference time.</div>
+          <div style={{ color: T.dim, fontSize: 12.5, fontFamily: MONO, lineHeight: 1.6 }}>Restore an image to see the output, inference time, and size.</div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 11 }}>
-            {hasGT ? (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 11 }}>
-                <MetricCard big label="PSNR" unit="dB" accent={T.output}
-                  value={modelMetrics ? fmt(modelMetrics.psnr, 2) : "…"}
-                  delta={showDelta && modelMetrics ? deltaOf(modelMetrics.psnr, baselineMetrics.psnr, true) : null} />
-                <MetricCard big label="SSIM"
-                  value={modelMetrics ? fmt(modelMetrics.ssim, 3) : "…"}
-                  delta={showDelta && modelMetrics ? deltaOf(modelMetrics.ssim, baselineMetrics.ssim, true) : null} />
-              </div>
-            ) : (
-              <div style={{ display: "flex", gap: 9, alignItems: "flex-start", color: T.dim, fontSize: 12, fontFamily: MONO, lineHeight: 1.6 }}>
-                <Info size={14} color={T.faint} style={{ flex: "0 0 auto", marginTop: 1 }} />
-                <span>PSNR and SSIM need a clean reference image. Add a ground-truth image to measure restoration quality.</span>
-              </div>
-            )}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 11 }}>
-              <MetricCard label="Inference" unit="ms" value={result.timeMs.toFixed(0)} />
-              <MetricCard label="Output" value={`${result.outputWidth}×${result.outputHeight}`} />
+              <MetricCard big label="Inference" unit="ms" accent={T.output} value={result.timeMs.toFixed(0)} />
+              <MetricCard big label="Output" value={`${result.outputWidth}×${result.outputHeight}`} />
             </div>
-            {hasGT && modelMetrics && (
-              <div style={{ fontSize: 10, color: T.faint, fontFamily: MONO }}>
-                MAE {fmt(modelMetrics.mae, 2)} · RMSE {fmt(modelMetrics.rmse, 2)} · measured in-browser vs. ground truth
-              </div>
-            )}
             <div style={{ fontSize: 10, color: T.faint, fontFamily: MONO }}>{result.modelName}</div>
           </div>
         )}
@@ -636,8 +600,7 @@ function Hero({ onUploadInput, samples, onPickSample }) {
   );
 }
 
-function SourceBar({ source, result, busy, onUploadGT }) {
-  const gtInput = useRef(null);
+function SourceBar({ source, result, busy }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12, ...panel(T.paper, 4), padding: "10px 12px" }}>
       <img src={source.url} alt="" style={{ width: 44, height: 44, objectFit: "cover", border: BORDER, borderRadius: 3, background: T.stage, flex: "0 0 auto" }} />
@@ -650,14 +613,6 @@ function SourceBar({ source, result, busy, onUploadGT }) {
         </div>
       </div>
       <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
-        {source.gtUrl ? (
-          <Tag color={T.gt}>ground truth ✓</Tag>
-        ) : (
-          <button className="pixel-btn" onClick={() => gtInput.current?.click()} style={{ padding: "6px 10px", fontSize: 10.5, background: T.cream2, color: T.ink }}>
-            <ImagePlus size={12} /> add ground truth
-            <input ref={gtInput} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) onUploadGT(f); }} />
-          </button>
-        )}
         {result ? (
           <span style={{ display: "flex", alignItems: "center", gap: 7, color: T.green, fontFamily: MONO, fontWeight: 600, fontSize: 12 }}><Check size={15} /> Restored · <Mono style={{ color: T.dim, fontWeight: 400 }}>{result.timeMs.toFixed(0)} ms</Mono></span>
         ) : busy ? (
@@ -686,11 +641,6 @@ function InputPreview({ source, busy, onRestore }) {
 }
 
 // ---- app -------------------------------------------------------------------
-async function computeMetricsVsGT(candidateUrl, gtUrl, w, h) {
-  const [cand, ref] = await Promise.all([urlToImageData(candidateUrl, w, h), urlToImageData(gtUrl, w, h)]);
-  return { ...fullReferenceMetrics(cand.data, ref.data, w, h), source: "client" };
-}
-
 function SectionHead({ children, hint }) {
   return (
     <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
@@ -706,40 +656,34 @@ export default function App() {
   const [baselineEnabled, setBaselineEnabled] = useState(true);
   const [result, setResult] = useState(null);
   const [baseline, setBaseline] = useState(null);
-  const [modelMetrics, setModelMetrics] = useState(null);
-  const [baselineMetrics, setBaselineMetrics] = useState(null);
   const [stage, setStage] = useState("idle");
   const [error, setError] = useState(null);
   const runId = useRef(0);
 
   useEffect(() => { setSamples(buildSamplePairs()); }, []);
 
-  const resetRun = useCallback(() => { setResult(null); setBaseline(null); setModelMetrics(null); setBaselineMetrics(null); setStage("idle"); setError(null); }, []);
+  const resetRun = useCallback(() => { setResult(null); setBaseline(null); setStage("idle"); setError(null); }, []);
   const selectSource = useCallback((src) => { resetRun(); setSource(src); }, [resetRun]);
 
   const onUploadInput = useCallback(async (file) => {
     const url = URL.createObjectURL(file);
     const img = await loadImageEl(url);
-    selectSource({ id: `upload-${Date.now()}`, name: file.name, url, width: img.naturalWidth, height: img.naturalHeight, gtUrl: null, degradation: null, isSample: false, file });
+    const isColor = detectIsColor(canvasFromImageEl(img));
+    selectSource({ id: `upload-${Date.now()}`, name: file.name, url, width: img.naturalWidth, height: img.naturalHeight, degradation: null, isSample: false, isColor, file });
   }, [selectSource]);
-
-  const onUploadGT = useCallback(async (file) => { const gtUrl = URL.createObjectURL(file); setSource((prev) => prev ? { ...prev, gtUrl } : prev); resetRun(); }, [resetRun]);
 
   const run = useCallback(async (src, withBaseline) => {
     const id = ++runId.current; const stale = () => id !== runId.current;
-    setError(null); setResult(null); setBaseline(null); setModelMetrics(null); setBaselineMetrics(null);
+    setError(null); setResult(null); setBaseline(null);
     try {
       setStage("preprocess");
       const res = await runBackendRestore({ imageUrl: src.url });
       if (stale()) return;
       setStage("infer"); setResult(res);
-      const w = res.outputWidth, h = res.outputHeight;
-      if (src.gtUrl) { setStage("metrics"); const m = await computeMetricsVsGT(res.restoredUrl, src.gtUrl, w, h); if (stale()) return; setModelMetrics(m); }
       if (withBaseline) {
         setStage("baseline");
-        const base = await buildBaseline({ imageUrl: src.url, gtUrl: src.gtUrl, scaleFactor: src.scaleFactor });
+        const base = await buildBaseline({ imageUrl: src.url, scaleFactor: src.scaleFactor });
         if (stale()) return; setBaseline(base);
-        if (src.gtUrl) { const bm = await computeMetricsVsGT(base.url, src.gtUrl, w, h); if (stale()) return; setBaselineMetrics(bm); }
       }
       if (!stale()) setStage("done");
     } catch (e) { if (!stale()) { setError(e); setStage("idle"); } }
@@ -750,20 +694,17 @@ export default function App() {
     if (!baselineEnabled || !result || baseline || !source) return;
     let alive = true;
     (async () => {
-      const base = await buildBaseline({ imageUrl: source.url, gtUrl: source.gtUrl, scaleFactor: source.scaleFactor });
-      if (!alive) return; setBaseline(base);
-      if (source.gtUrl) { const bm = await computeMetricsVsGT(base.url, source.gtUrl, result.outputWidth, result.outputHeight); if (alive) setBaselineMetrics(bm); }
+      const base = await buildBaseline({ imageUrl: source.url, scaleFactor: source.scaleFactor });
+      if (alive) setBaseline(base);
     })();
     return () => { alive = false; };
   }, [baselineEnabled, result, baseline, source]);
 
   const doRun = useCallback(() => { if (source) run(source, baselineEnabled); }, [source, baselineEnabled, run]);
   const busy = stage !== "idle" && stage !== "done";
-  const hasGT = !!source?.gtUrl;
   const layers = [
     { key: "input", url: source?.url },
     { key: "output", url: result?.restoredUrl },
-    { key: "gt", url: source?.gtUrl },
     ...(baselineEnabled ? [{ key: "baseline", url: baseline?.url }] : []),
   ];
 
@@ -796,7 +737,8 @@ export default function App() {
       ) : (
         <main className="rest-main" style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) 330px", gap: 18, padding: 20, alignItems: "start", maxWidth: 1200, margin: "0 auto" }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 16, minWidth: 0 }}>
-            <SourceBar source={source} result={result} busy={busy} onUploadGT={onUploadGT} />
+            <SourceBar source={source} result={result} busy={busy} />
+            {source.isColor && <ColorWarning />}
             {error && <ErrorNote>Restoration failed: {error.message}</ErrorNote>}
             {result ? (
               <>
@@ -812,7 +754,7 @@ export default function App() {
               </>
             )}
           </div>
-          <ResultsPanel result={result} modelMetrics={modelMetrics} baselineMetrics={baselineMetrics} hasGT={hasGT} baselineEnabled={baselineEnabled} onToggleBaseline={() => setBaselineEnabled((v) => !v)} busy={busy} />
+          <ResultsPanel result={result} baselineEnabled={baselineEnabled} onToggleBaseline={() => setBaselineEnabled((v) => !v)} busy={busy} />
         </main>
       )}
     </div>

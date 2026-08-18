@@ -90,18 +90,22 @@ Input values fall outside the ground-truth range. This is consistent with the pr
 python eval.py --input <input_dir> --output <output_dir>
 ```
 
-Requirements:
-- Discovers files by explicit extension filter; ignores anything else (`.DS_Store`, `README`, nested directories).
-- Output filenames match input filenames **exactly**. No suffixes.
-- Per-file try/except: a single bad file is logged and skipped, never aborts the run.
-- Handles arbitrary spatial input size, not only 128×128.
-- Handles a final partial batch.
-- Defined behaviour on an empty input directory.
-- Runs under `torch.inference_mode()`, with a warmup, and `torch.cuda.synchronize()` before any timer stops.
-- Device selection follows the same pattern already used in `scripts/train.py`/`evaluate.py`/`predict.py`: `torch.device("cuda" if torch.cuda.is_available() else "cpu")`. On KLA's H100, this must resolve to `cuda` — **eval.py must log the selected device explicitly on startup**, so a broken CUDA environment during grading fails loudly (wrong-looking timing numbers, visible in the log) instead of silently completing on CPU with numbers that look plausible but aren't what H100 would produce. Do not hardcode `"cuda"` unconditionally — that would crash on a machine without a GPU rather than degrading, which is worse for local testing/CI even though the grading machine always has one.
-- No hardcoded paths. No manual edits required.
+**[BUILT — found via GitHub push, not written by this thread]** `eval.py` (340 lines) already exists, committed by a teammate ("matin impex", commit `1014598`, 2026-08-16). Reviewed in full and verified end-to-end 2026-08-17 against the real 400-image official test set (`data/official/Test_NoisyLR/NoisyLR`): 400/400 restored, 0 failures, output filenames match input exactly, output `(256,256)` float32 in `[0,1]`.
 
-**[VERIFY — highest priority, blocks all other P0 work]** The official submission contract for: input extension, output extension, output dtype, output shape, output filename convention, directory structure. Read the problem PDF before writing this script. If they diff `.npy` float arrays and we write PNGs, we quantize to 8 bits before scoring and the hardening work targets the wrong output path.
+Requirements and their status:
+- Discovers files by explicit extension filter; ignores anything else (`.DS_Store`, `README`, nested directories). **DONE** — `discover_input_files` filters on `.suffix.lower() == ".npy"`, skips hidden files, does not recurse.
+- Output filenames match input filenames **exactly**. No suffixes. **DONE, verified** — see above.
+- Per-file try/except: a single bad file is logged and skipped, never aborts the run. **DONE** — load errors and per-image restore errors are both caught and counted as failures without aborting.
+- Handles arbitrary spatial input size, not only 128×128. **DONE** — only checks `arr.ndim == 2`, no fixed-size assertion; consistent with the `KLADataset` fix made the same day.
+- Handles a final partial batch. **DONE** — batch flushes on `file_idx == total_files - 1`.
+- Defined behaviour on an empty input directory. **DONE** — logs a warning and exits 0.
+- Runs under `torch.inference_mode()`, with a warmup, and `torch.cuda.synchronize()` before any timer stops. **DONE.**
+- Device selection follows the same pattern already used in `scripts/train.py`/`evaluate.py`/`predict.py`: `torch.device("cuda" if torch.cuda.is_available() else "cpu")`. On KLA's H100, this must resolve to `cuda` — **eval.py must log the selected device explicitly on startup**, so a broken CUDA environment during grading fails loudly (wrong-looking timing numbers, visible in the log) instead of silently completing on CPU with numbers that look plausible but aren't what H100 would produce. Do not hardcode `"cuda"` unconditionally — that would crash on a machine without a GPU rather than degrading, which is worse for local testing/CI even though the grading machine always has one. **DONE** — logs `Target Device: {device.type.upper()}` on startup.
+- No hardcoded paths. No manual edits required. **DONE** — checkpoint default is relative to `SCRIPT_DIR`, input/output are required CLI args.
+- **[FIXED 2026-08-17]** End-to-end vs. model-only timing, reported separately (Phase 5 requirement) — originally only reported one combined number. `process_batch` now brackets the forward pass alone with `torch.cuda.synchronize()` and returns `model_only_seconds` separately from the outer end-to-end timer. Verified: on this CPU dev machine, end-to-end 684.40 ms/image vs. model-only 683.44 ms/image (nearly identical here since 4-way TTA dominates on CPU; expect the gap to be much more visible on H100, where the forward pass is fast and I/O becomes a larger fraction).
+- TTA: ships with 4-way flip TTA on by default, `--no-tta` to disable — resolves the "does eval.py match the TTA used to report numbers" open question below.
+
+**[VERIFY — still highest priority, blocks all other P0 work, NOT resolved by eval.py existing]** The official submission contract for: input extension, output extension, output dtype, output shape, output filename convention, directory structure. `eval.py`'s `.npy`-in/`.npy`-out/float32 design is a reasonable, working assumption — consistent with everything else built so far — but it has not been checked against the actual KLA problem PDF's submission section (Component 2 was never provided in this thread). Good code built on an unverified assumption is still an unverified assumption. Read the problem PDF before trusting this. If they diff `.npy` float arrays and we write PNGs, we quantize to 8 bits before scoring and the hardening work targets the wrong output path.
 
 ### 6.2 Normalization contract
 
